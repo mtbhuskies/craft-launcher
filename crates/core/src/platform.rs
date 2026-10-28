@@ -51,7 +51,7 @@ impl Arch {
 /// A package format a release ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PackageKind {
-    /// Windows Installer package (installs for all users into Program Files).
+    /// Windows Installer package (per user by default; an existing per-machine copy stays per-machine).
     Msi,
     /// Windows zip with the exe at the top level.
     PortableZip,

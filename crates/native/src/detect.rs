@@ -100,13 +100,35 @@ fn is_installer_entry(app: &CraftApp, display_name: &str, publisher: &str) -> bo
 }
 
 /// Where a Windows install of `app` may keep its exe, in the order to try: the entry's
-/// `InstallLocation`, then `<App>` under each Program Files root for each name the app has had,
+/// `InstallLocation`, then `<App>` under each install root (the `ArtCraft` suite folder first, then the
+/// root itself, for Program Files and the per-user Programs folder) for each name the app has had,
 /// and in each folder `<stem>.exe` for each stem, current first. Doesn't touch the disk.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn exe_candidates(app: &CraftApp, location: Option<&Path>, program_files: &[PathBuf]) -> Vec<PathBuf> {
     let in_program_files = program_files.iter().flat_map(|root| app.names().map(move |n| root.join(n)));
     let dirs = location.map(Path::to_path_buf).into_iter().chain(in_program_files);
     dirs.flat_map(|d| app.stems().map(move |s| d.join(format!("{s}.exe")))).collect()
+}
+
+/// The folder under `ArtCraft` that the MSI installs to when it is not the display name: the launcher
+/// installs to `ArtCraft\Launcher`, the apps to `ArtCraft\<App>`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn suite_folders(app: &CraftApp, roots: &[PathBuf]) -> Vec<PathBuf> {
+    if app.id != artcraft_launcher_core::catalog::LAUNCHER_ID {
+        return Vec::new();
+    }
+    roots.iter().map(|root| root.join("ArtCraft").join("Launcher")).collect()
+}
+
+/// The registry keys an MSI records its install folder in (value `InstallDir`). The launcher's package
+/// keeps its own key, under the publisher name.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn install_dir_keys(app: &CraftApp) -> Vec<String> {
+    let mut keys = vec![format!(r"SOFTWARE\{}", app.name)];
+    if app.id == artcraft_launcher_core::catalog::LAUNCHER_ID {
+        keys.push(format!(r"SOFTWARE\{PUBLISHER}\{}", app.name));
+    }
+    keys
 }
 
 /// Version from `<app> --version` output. Binaries print the machine id (`photocraft 0.7.0`),
@@ -177,10 +199,10 @@ pub mod macos {
 pub mod windows {
     use std::path::PathBuf;
 
-    use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    use winreg::{HKEY, RegKey};
 
-    use super::{CraftApp, InstallSource, Installed, exe_candidates, is_installer_entry, version};
+    use super::{CraftApp, InstallSource, Installed, exe_candidates, install_dir_keys, is_installer_entry, suite_folders, version};
 
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 
@@ -208,14 +230,42 @@ pub mod windows {
         pub product_code: String,
         pub version: Option<artcraft_launcher_core::version::Version>,
         pub exe: Option<PathBuf>,
+        /// The context of the uninstall record that named it: the machine's records are per-machine,
+        /// the current account's own are per-user.
+        pub scope: crate::install::MsiScope,
+    }
+
+    /// Where the uninstall records of an MSI are kept: the machine's (both registry views) and the account's own.
+    const UNINSTALL_ROOTS: [(HKEY, u32); 3] = [(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY), (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY), (HKEY_CURRENT_USER, 0)];
+
+    fn record_context(hive: HKEY) -> crate::install::MsiScope {
+        if hive == HKEY_CURRENT_USER { crate::install::MsiScope::PerUser } else { crate::install::MsiScope::PerMachine }
+    }
+
+    /// The context every uninstall record of `product_code` places it in, when Windows Installer cannot be
+    /// asked. All records are read, not the deduplicated list, so a copy registered both per-user and
+    /// per-machine gives no answer and the update stops.
+    pub fn record_scope(app: &CraftApp, product_code: &str) -> Option<crate::install::MsiScope> {
+        let scopes = UNINSTALL_ROOTS.into_iter().filter_map(|(hive, flags)| {
+            let root = RegKey::predef(hive).open_subkey_with_flags(UNINSTALL, KEY_READ | flags).ok()?;
+            let key = root.open_subkey_with_flags(product_code, KEY_READ | flags).ok()?;
+            let name: String = key.get_value("DisplayName").unwrap_or_default();
+            let publisher: String = key.get_value("Publisher").unwrap_or_default();
+            is_installer_entry(app, &name, &publisher).then(|| record_context(hive))
+        });
+        crate::msi_context::single_scope(scopes)
     }
 
     /// Every Windows Installer entry for `app`, newest first.
     pub fn msi_installs(app: &CraftApp) -> Vec<MsiInstall> {
         let mut out = Vec::new();
-        for (hive, flags) in [(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY), (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY), (HKEY_CURRENT_USER, 0)] {
+        for (hive, flags) in UNINSTALL_ROOTS {
             let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(UNINSTALL, KEY_READ | flags) else { continue };
             for code in root.enum_keys().flatten() {
+                // App-authored uninstall rows are not MSI product identities.
+                if !crate::msi_context::valid_product_code(&code) {
+                    continue;
+                }
                 let Ok(key) = root.open_subkey_with_flags(&code, KEY_READ | flags) else { continue };
                 let name: String = key.get_value("DisplayName").unwrap_or_default();
                 let publisher: String = key.get_value("Publisher").unwrap_or_default();
@@ -224,8 +274,9 @@ pub mod windows {
                 }
                 let version = key.get_value::<String, _>("DisplayVersion").ok().and_then(|v| version::parse(&v));
                 let location: String = key.get_value("InstallLocation").unwrap_or_default();
-                let exe = exe_path(app, (!location.is_empty()).then(|| PathBuf::from(location)).or_else(|| install_dir(app)));
-                out.push(MsiInstall { product_code: code, version, exe });
+                let exe =
+                    exe_path(app, (!location.is_empty()).then(|| PathBuf::from(location)).or_else(|| install_dir(app, hive, flags)), hive, flags);
+                out.push(MsiInstall { product_code: code, version, exe, scope: record_context(hive) });
             }
         }
         out.sort_by(|a, b| match (&b.version, &a.version) {
@@ -237,37 +288,57 @@ pub mod windows {
         out
     }
 
-    /// The folder the app's MSI remembers for its next upgrade, which is where it went when the
-    /// launcher chose the folder.
-    fn install_dir(app: &CraftApp) -> Option<PathBuf> {
-        [KEY_WOW64_64KEY, KEY_WOW64_32KEY].into_iter().find_map(|flags| {
-            let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(format!(r"SOFTWARE\{}", app.name), KEY_READ | flags).ok()?;
-            key.get_value::<String, _>("InstallDir").ok().filter(|d| !d.is_empty()).map(PathBuf::from)
+    /// The folder the app's MSI remembers for its next upgrade, read from the same registry view as the
+    /// uninstall record that named the install. A per-machine record (HKLM) therefore reads HKLM, and a
+    /// per-user record (HKCU, dual-scope packages) reads HKCU, so one scope never resolves to the other's folder.
+    fn install_dir(app: &CraftApp, hive: HKEY, flags: u32) -> Option<PathBuf> {
+        install_dir_keys(app).into_iter().find_map(|path| {
+            let key = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ | flags).ok()?;
+            let dir = key.get_value::<String, _>("InstallDir").ok()?;
+            (!dir.is_empty()).then(|| PathBuf::from(dir))
         })
     }
 
-    /// The app's exe: from `App Paths`, the install folder, or Program Files.
-    fn exe_path(app: &CraftApp, location: Option<PathBuf>) -> Option<PathBuf> {
+    /// The app's exe for one uninstall record, found only in that record's own scope: the recorded
+    /// folder first, then `App Paths` in the record's hive and registry view, then the usual folders
+    /// for that scope (`ArtCraft` suite folder first, then the bare root, for older installs). A
+    /// per-machine entry therefore never stands in for a per-user record, or the other way round.
+    fn exe_path(app: &CraftApp, location: Option<PathBuf>, hive: HKEY, flags: u32) -> Option<PathBuf> {
+        if let Some(found) = exe_candidates(app, location.as_deref(), &[]).into_iter().find(|p| p.exists()) {
+            return Some(found);
+        }
         for stem in app.stems() {
             let app_paths = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{stem}.exe");
-            for flags in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
-                if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&app_paths, KEY_READ | flags)
-                    && let Ok(path) = key.get_value::<String, _>("")
-                {
-                    let p = PathBuf::from(path.trim_matches('"'));
-                    if p.exists() {
-                        return Some(p);
-                    }
+            if let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(&app_paths, KEY_READ | flags)
+                && let Ok(path) = key.get_value::<String, _>("")
+            {
+                let p = PathBuf::from(path.trim_matches('"'));
+                if p.exists() {
+                    return Some(p);
                 }
             }
         }
-        let mut roots = Vec::new();
-        for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
-            if let Some(pf) = std::env::var_os(var) {
-                roots.push(PathBuf::from(pf));
+        let roots: Vec<PathBuf> = if hive == HKEY_CURRENT_USER {
+            // Per-user installs (dual-scope packages) live in the user's own Programs folder.
+            std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Programs")).into_iter().collect()
+        } else {
+            let mut roots: Vec<PathBuf> = Vec::new();
+            for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+                if let Some(pf) = std::env::var_os(var).map(PathBuf::from)
+                    && !roots.contains(&pf)
+                {
+                    roots.push(pf);
+                }
             }
+            roots
+        };
+        let launcher_folders = suite_folders(app, &roots);
+        if let Some(found) = launcher_folders.iter().find_map(|dir| exe_candidates(app, Some(dir), &[]).into_iter().find(|p| p.exists())) {
+            return Some(found);
         }
-        exe_candidates(app, location.as_deref(), &roots).into_iter().find(|p| p.exists())
+        let mut candidates: Vec<PathBuf> = roots.iter().map(|root| root.join("ArtCraft")).collect();
+        candidates.extend(roots);
+        exe_candidates(app, None, &candidates).into_iter().find(|p| p.exists())
     }
 
     pub fn detect(app: &CraftApp) -> Option<Installed> {
@@ -773,5 +844,24 @@ mod tests {
             let with_location: Vec<PathBuf> = std::iter::once(location.join(&exe)).chain(in_program_files).collect();
             assert_eq!(exe_candidates(a, Some(&location), &roots), with_location);
         }
+    }
+
+    #[test]
+    fn the_launcher_msi_installs_to_artcraft_launcher_and_the_apps_do_not() {
+        let roots = roots();
+        let want: Vec<PathBuf> = roots.iter().map(|root| root.join("ArtCraft").join("Launcher")).collect();
+        assert_eq!(suite_folders(&artcraft_launcher_core::catalog::LAUNCHER, &roots), want);
+        let photo = CraftApp::by_id("photocraft").unwrap();
+        assert!(suite_folders(photo, &roots).is_empty());
+    }
+
+    #[test]
+    fn the_launcher_records_its_folder_under_the_publisher_key() {
+        assert_eq!(
+            install_dir_keys(&artcraft_launcher_core::catalog::LAUNCHER),
+            [r"SOFTWARE\ArtCraft Launcher".to_string(), format!(r"SOFTWARE\{LEARNING_MACHINES}\ArtCraft Launcher")]
+        );
+        let photo = CraftApp::by_id("photocraft").unwrap();
+        assert_eq!(install_dir_keys(photo), [r"SOFTWARE\PhotoCraft".to_string()]);
     }
 }
